@@ -61,26 +61,57 @@ class CryptoShakeoutMonitor:
         """Анализ тренда на старшем таймфрейме"""
         try:
             timeframe = self.timeframes[self.current_mode]['trend']
+            self.logger.info(f"Анализируем тренд {symbol} на таймфрейме {timeframe}")
+
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=100)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-            # Определяем максимумы и минимумы
-            df['higher_high'] = df['high'].rolling(window=3).apply(lambda x: x[2] > x[1] > x[0])
-            df['higher_low'] = df['low'].rolling(window=3).apply(lambda x: x[2] > x[1] > x[0])
-            df['lower_high'] = df['high'].rolling(window=3).apply(lambda x: x[2] < x[1] < x[0])
-            df['lower_low'] = df['low'].rolling(window=3).apply(lambda x: x[2] < x[1] < x[0])
+            self.logger.info(f"Получено {len(df)} свечей")
 
-            # Последние 3 свечи
-            last_candles = df.tail(3)
+            # Берем последние 3 свечи
+            last_3 = df.tail(3)
 
-            if last_candles['higher_high'].any() and last_candles['higher_low'].any():
+            # Проверяем тренд напрямую
+            highs = last_3['high'].values
+            lows = last_3['low'].values
+
+            # Логируем значения
+            self.logger.info(f"""
+    Анализ последних 3 свечей:
+    Максимумы (highs): {highs}
+    Минимумы (lows): {lows}
+    """)
+
+            # Проверяем восходящий тренд
+            higher_highs = (highs[1] > highs[0]) and (highs[2] > highs[1])
+            higher_lows = (lows[1] > lows[0]) and (lows[2] > lows[1])
+
+            # Проверяем нисходящий тренд
+            lower_highs = (highs[1] < highs[0]) and (highs[2] < highs[1])
+            lower_lows = (lows[1] < lows[0]) and (lows[2] < lows[1])
+
+            self.logger.info(f"""
+    Результаты анализа:
+    Higher highs: {higher_highs}
+    Higher lows: {higher_lows}
+    Lower highs: {lower_highs}
+    Lower lows: {lower_lows}
+    """)
+
+            if higher_highs and higher_lows:
+                self.logger.info("Определен BULLISH тренд")
                 return 'bullish'
-            elif last_candles['lower_high'].any() and last_candles['lower_low'].any():
+            elif lower_highs and lower_lows:
+                self.logger.info("Определен BEARISH тренд")
                 return 'bearish'
+
+            self.logger.info("Определен NEUTRAL тренд")
             return 'neutral'
 
         except Exception as e:
             self.logger.error(f'Ошибка при анализе тренда: {str(e)}')
+            self.logger.exception("Полный стек ошибки:")
             return 'neutral'
 
     def detect_shakeout(self, df: pd.DataFrame, trend: str) -> Dict:
@@ -214,7 +245,7 @@ async def main():
     monitor = CryptoShakeoutMonitor(
         exchange_id='binance',
         min_volume=50000,
-        check_interval=3600,
+        check_interval=120,
         mode='TESTING'  # Для быстрого тестирования
     )
     await monitor.run_forever(alert_callback=send_telegram_alert)
