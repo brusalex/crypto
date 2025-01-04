@@ -83,42 +83,81 @@ class CryptoShakeoutMonitor:
             self.logger.error(f'Ошибка при анализе тренда: {str(e)}')
             return 'neutral'
 
-    def detect_shakeout(self, df: pd.DataFrame, trend: str) -> bool:
-        """Определение паттерна встряски"""
+    def detect_shakeout(self, df: pd.DataFrame, trend: str) -> Dict:
+        """Определение паттерна встряски с типом сигнала"""
         try:
             df = self.calculate_indicators(df)
             last_row = df.iloc[-1]
             prev_row = df.iloc[-2]
-            self.logger.info(f"""
-            Checking shakeout:
-            - Price: {last_row['close']}
-            - EMA: {last_row['center_ema']}
-            - MACD current: {last_row['macd']}
-            - MACD previous: {prev_row['macd']}
-            """)
+
+            signal = {
+                'is_signal': False,
+                'type': None,  # 'LONG' или 'SHORT'
+                'price': last_row['close'],
+                'macd_value': last_row['macd']
+            }
 
             if trend == 'bullish':
-                # Цена у средней или ниже + красная линия MACD начинает белеть
+                # Сигнал на лонг в бычьем тренде
                 price_near_ema = last_row['close'] <= last_row['center_ema']
                 macd_improving = last_row['macd'] > prev_row['macd']
-                self.logger.info(f"""
-                Bullish conditions:
-                - Price near EMA: {price_near_ema}
-                - MACD improving: {macd_improving}
-                """)
-                return price_near_ema and macd_improving
+
+                if price_near_ema and macd_improving:
+                    signal['is_signal'] = True
+                    signal['type'] = 'LONG'
 
             elif trend == 'bearish':
-                # Цена у средней или выше + зеленая линия MACD начинает белеть
+                # Сигнал на шорт в медвежьем тренде
                 price_near_ema = last_row['close'] >= last_row['center_ema']
                 macd_declining = last_row['macd'] < prev_row['macd']
-                return price_near_ema and macd_declining
 
-            return False
+                if price_near_ema and macd_declining:
+                    signal['is_signal'] = True
+                    signal['type'] = 'SHORT'
+
+            self.logger.info(f"Тренд: {trend}, Тип сигнала: {signal['type']}")
+            return signal
 
         except Exception as e:
             self.logger.error(f'Ошибка при определении встряски: {str(e)}')
-            return False
+            return {'is_signal': False, 'type': None}
+
+    # def detect_shakeout2(self, df: pd.DataFrame, trend: str) -> bool:
+    #     """Определение паттерна встряски"""
+    #     try:
+    #         df = self.calculate_indicators(df)
+    #         last_row = df.iloc[-1]
+    #         prev_row = df.iloc[-2]
+    #         self.logger.info(f"""
+    #         Checking shakeout:
+    #         - Price: {last_row['close']}
+    #         - EMA: {last_row['center_ema']}
+    #         - MACD current: {last_row['macd']}
+    #         - MACD previous: {prev_row['macd']}
+    #         """)
+    #
+    #         if trend == 'bullish':
+    #             # Цена у средней или ниже + красная линия MACD начинает белеть
+    #             price_near_ema = last_row['close'] <= last_row['center_ema']
+    #             macd_improving = last_row['macd'] > prev_row['macd']
+    #             self.logger.info(f"""
+    #             Bullish conditions:
+    #             - Price near EMA: {price_near_ema}
+    #             - MACD improving: {macd_improving}
+    #             """)
+    #             return price_near_ema and macd_improving
+    #
+    #         elif trend == 'bearish':
+    #             # Цена у средней или выше + зеленая линия MACD начинает белеть
+    #             price_near_ema = last_row['close'] >= last_row['center_ema']
+    #             macd_declining = last_row['macd'] < prev_row['macd']
+    #             return price_near_ema and macd_declining
+    #
+    #         return False
+    #
+    #     except Exception as e:
+    #         self.logger.error(f'Ошибка при определении встряски: {str(e)}')
+    #         return False
 
     async def run_forever(self, alert_callback=None):
         """Основной цикл мониторинга"""
@@ -141,16 +180,21 @@ class CryptoShakeoutMonitor:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
                 # 3. Ищем встряску
-                if self.detect_shakeout(df, trend):
+                signal = self.detect_shakeout(df, trend)
+
+                if signal['is_signal']:
                     message = f"""
-🚨 Встряска на BTC!
-📈 Тренд: {trend}
-💰 Цена: {df['close'].iloc[-1]:.2f}
-⏰ Время: {datetime.now()}
-                    """
+    🚨 Встряска на BTC!
+    📈 Тренд: {trend}
+    💰 Цена: {signal['price']:.2f}
+    📊 Тип сигнала: {'🟢 LONG' if signal['type'] == 'LONG' else '🔴 SHORT'}
+    ⏰ Время: {datetime.now()}
+
+    🔍 MACD: {signal['macd_value']:.6f}
+    """
                     if alert_callback:
                         await alert_callback(message)
-                        self.logger.info('Отправлен сигнал о встряске')
+                        self.logger.info(f'Отправлен сигнал о встряске: {signal["type"]}')
 
                 time.sleep(self.check_interval)
 
