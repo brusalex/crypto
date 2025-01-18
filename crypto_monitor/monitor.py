@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import logging
 from typing import List, Dict, Tuple
 import time
+import sys
 
 
 class CryptoShakeoutMonitor:
@@ -29,10 +30,16 @@ class CryptoShakeoutMonitor:
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('crypto_monitor.log'),
-                logging.StreamHandler()
+                logging.FileHandler('crypto_monitor.log', encoding='utf-8'),
+                logging.StreamHandler(sys.stdout)  # Use stdout for console output
             ]
         )
+        # Force console encoding to UTF-8
+        if sys.platform.startswith('win'):
+            import codecs
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+
         self.logger = logging.getLogger(__name__)
 
         self.exchange = getattr(ccxt, exchange_id)()
