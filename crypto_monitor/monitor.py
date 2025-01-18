@@ -16,11 +16,11 @@ class CryptoShakeoutMonitor:
                  check_interval: int = 3600,
                  mode: str = 'TESTING'):  # TESTING, SWING_TRADING, или INTRADAY_TRADING
 
-        # Настройка таймфреймов в зависимости от режима
+        # Updated timeframes with proper periods
         self.timeframes = {
-            'SWING_TRADING': {'trend': '1w', 'entry': '1d'},
-            'INTRADAY_TRADING': {'trend': '1d', 'entry': '1h'},
-            'TESTING': {'trend': '1d', 'entry': '1h'}
+            'SWING_TRADING': {'trend': '1w', 'entry': '1d', 'trend_limit': 52},  # 1 year of weekly data
+            'INTRADAY_TRADING': {'trend': '1d', 'entry': '1h', 'trend_limit': 180},  # 6 months of daily data
+            'TESTING': {'trend': '1d', 'entry': '1h', 'trend_limit': 180}  # 6 months for testing
         }
         self.current_mode = mode
 
@@ -58,52 +58,60 @@ class CryptoShakeoutMonitor:
             return df
 
     def analyze_trend(self, symbol: str) -> str:
-        """Анализ тренда на старшем таймфрейме"""
+        """Анализ тренда на старшем таймфрейме с использованием EMA и более длительного периода"""
         try:
             timeframe = self.timeframes[self.current_mode]['trend']
-            self.logger.info(f"Анализируем тренд {symbol} на таймфрейме {timeframe}")
+            limit = self.timeframes[self.current_mode]['trend_limit']
+            self.logger.info(f"Анализируем тренд {symbol} на таймфрейме {timeframe} за период {limit}")
 
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-            self.logger.info(f"Получено {len(df)} свечей")
-
-            # Берем последние 3 свечи
-            last_3 = df.tail(3)
-
-            # Проверяем тренд напрямую
-            highs = last_3['high'].values
-            lows = last_3['low'].values
-
-            # Логируем значения
-            self.logger.info(f"""
-    Анализ последних 3 свечей:
-    Максимумы (highs): {highs}
-    Минимумы (lows): {lows}
-    """)
-
-            # Проверяем восходящий тренд
-            higher_highs = (highs[1] > highs[0]) and (highs[2] > highs[1])
-            higher_lows = (lows[1] > lows[0]) and (lows[2] > lows[1])
-
-            # Проверяем нисходящий тренд
-            lower_highs = (highs[1] < highs[0]) and (highs[2] < highs[1])
-            lower_lows = (lows[1] < lows[0]) and (lows[2] < lows[1])
+            # Calculate Smart Vision EMA 20
+            df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+            
+            # Get last 20 periods for trend analysis
+            last_20 = df.tail(20)
+            
+            # Calculate trend based on EMA and price action
+            price_above_ema = last_20['close'].iloc[-1] > last_20['ema20'].iloc[-1]
+            ema_slope = (last_20['ema20'].iloc[-1] - last_20['ema20'].iloc[0]) / len(last_20)
+            
+            # Check for higher highs and higher lows in the recent period
+            recent_highs = last_20['high'].values
+            recent_lows = last_20['low'].values
+            
+            # Calculate trends using local maxima and minima
+            higher_highs = np.all(np.diff([h for h in recent_highs if h == np.maximum.accumulate(recent_highs)[recent_highs.tolist().index(h)]]) > 0)
+            higher_lows = np.all(np.diff([l for l in recent_lows if l == np.minimum.accumulate(recent_lows)[recent_lows.tolist().index(l)]]) > 0)
+            
+            lower_highs = np.all(np.diff([h for h in recent_highs if h == np.maximum.accumulate(recent_highs)[::-1][recent_highs.tolist()[::-1].index(h)]]) < 0)
+            lower_lows = np.all(np.diff([l for l in recent_lows if l == np.minimum.accumulate(recent_lows)[::-1][recent_lows.tolist()[::-1].index(l)]]) < 0)
 
             self.logger.info(f"""
-    Результаты анализа:
-    Higher highs: {higher_highs}
-    Higher lows: {higher_lows}
-    Lower highs: {lower_highs}
-    Lower lows: {lower_lows}
-    """)
+            Trend Analysis Results:
+            Price above EMA20: {price_above_ema}
+            EMA Slope: {ema_slope}
+            Higher Highs: {higher_highs}
+            Higher Lows: {higher_lows}
+            Lower Highs: {lower_highs}
+            Lower Lows: {lower_lows}
+            Last Price: {last_20['close'].iloc[-1]}
+            """)
 
-            if higher_highs and higher_lows:
-                self.logger.info("Определен BULLISH тренд")
+            # Determine trend with more flexible conditions
+            if price_above_ema and ema_slope > 0:
+                if higher_highs or higher_lows:
+                    self.logger.info("Определен Strong BULLISH тренд")
+                    return 'bullish'
+                self.logger.info("Определен BULLISH тренд (based on EMA)")
                 return 'bullish'
-            elif lower_highs and lower_lows:
-                self.logger.info("Определен BEARISH тренд")
+            elif not price_above_ema and ema_slope < 0:
+                if lower_highs or lower_lows:
+                    self.logger.info("Определен Strong BEARISH тренд")
+                    return 'bearish'
+                self.logger.info("Определен BEARISH тренд (based on EMA)")
                 return 'bearish'
 
             self.logger.info("Определен NEUTRAL тренд")
