@@ -130,80 +130,86 @@ class CryptoShakeoutMonitor:
             return 'neutral'
 
     def detect_shakeout(self, df: pd.DataFrame, trend: str) -> Dict:
-        """Определение паттерна встряски с типом сигнала"""
+        """
+        Ищет точки входа в позицию на основе пробоя зоны ценности (EMA) после отката.
+        
+        Args:
+            df: DataFrame со свечами (OHLCV данные)
+            trend: Текущий тренд ('bullish' - восходящий, 'bearish' - нисходящий)
+        
+        Returns:
+            Dict: Словарь с информацией о сигнале
+        """
         try:
+            # Рассчитываем технические индикаторы (MACD и EMA)
             df = self.calculate_indicators(df)
-            last_row = df.iloc[-1]
-            prev_row = df.iloc[-2]
-
+            
+            # Берём последнюю завершенную свечку
+            last_candle = df.iloc[-1]
+            
+            # Создаём структуру для хранения информации о сигнале
             signal = {
-                'is_signal': False,
-                'type': None,  # 'LONG' или 'SHORT'
-                'price': last_row['close'],
-                'macd_value': last_row['macd']
+                'is_signal': False,            # Флаг наличия сигнала
+                'type': None,                  # Тип сигнала (LONG или SHORT)
+                'price': last_candle['close'], # Текущая цена закрытия
+                'macd_value': last_candle['macd'],      # Значение MACD
+                'ema_value': last_candle['center_ema']  # Значение EMA (зона ценности)
             }
 
+            # Считаем положение цены относительно EMA
+            price_to_ema = last_candle['close'] / last_candle['center_ema']
+
+            # Логируем текущее состояние для отладки
+            self.logger.info(f"""
+            Анализ в реальном времени:
+            - Текущая цена: {last_candle['close']:.2f}
+            - EMA (зона ценности): {last_candle['center_ema']:.2f}
+            - MACD: {last_candle['macd']:.6f}
+            - Тренд: {trend}
+            - Соотношение цена/EMA: {price_to_ema:.4f}
+            """)
+
+            # ЛОГИКА ДЛЯ БЫЧЬЕГО ТРЕНДА (LONG)
             if trend == 'bullish':
-                # Сигнал на лонг в бычьем тренде
-                price_near_ema = last_row['close'] <= last_row['center_ema']
-                macd_improving = last_row['macd'] > prev_row['macd']
+                # Проверяем условия для входа в LONG:
+                # 1. Цена около или ниже EMA (откат завершился)
+                # 2. MACD в красной зоне (подтверждение отката)
+                if price_to_ema <= 1.02 and last_candle['macd'] < 0:
+                    if self.is_new_signal(last_candle['close'], last_candle['center_ema'], last_candle['macd']):
+                        self.logger.info(f"""
+                        🎯 Найдена точка входа (LONG):
+                        - Цена откатилась к зоне ценности
+                        - Соотношение цена/EMA: {price_to_ema:.4f}
+                        - MACD в красной зоне: {last_candle['macd']:.6f}
+                        """)
+                        signal['is_signal'] = True
+                        signal['type'] = 'LONG'
+                        self.update_last_signal(last_candle['close'], last_candle['center_ema'], 
+                                             last_candle['macd'], 'LONG')
 
-                if price_near_ema and macd_improving:
-                    signal['is_signal'] = True
-                    signal['type'] = 'LONG'
-
+            # ЛОГИКА ДЛЯ МЕДВЕЖЬЕГО ТРЕНДА (SHORT)
             elif trend == 'bearish':
-                # Сигнал на шорт в медвежьем тренде
-                price_near_ema = last_row['close'] >= last_row['center_ema']
-                macd_declining = last_row['macd'] < prev_row['macd']
+                # Проверяем условия для входа в SHORT:
+                # 1. Цена около или выше EMA (откат завершился)
+                # 2. MACD в зелёной зоне (подтверждение отката)
+                if price_to_ema >= 0.98 and last_candle['macd'] > 0:
+                    if self.is_new_signal(last_candle['close'], last_candle['center_ema'], last_candle['macd']):
+                        self.logger.info(f"""
+                        🎯 Найдена точка входа (SHORT):
+                        - Цена поднялась к зоне ценности
+                        - Соотношение цена/EMA: {price_to_ema:.4f}
+                        - MACD в зелёной зоне: {last_candle['macd']:.6f}
+                        """)
+                        signal['is_signal'] = True
+                        signal['type'] = 'SHORT'
+                        self.update_last_signal(last_candle['close'], last_candle['center_ema'], 
+                                             last_candle['macd'], 'SHORT')
 
-                if price_near_ema and macd_declining:
-                    signal['is_signal'] = True
-                    signal['type'] = 'SHORT'
-
-            self.logger.info(f"Тренд: {trend}, Тип сигнала: {signal['type']}")
             return signal
 
         except Exception as e:
             self.logger.error(f'Ошибка при определении встряски: {str(e)}')
-            return {'is_signal': False, 'type': None}
-
-    # def detect_shakeout2(self, df: pd.DataFrame, trend: str) -> bool:
-    #     """Определение паттерна встряски"""
-    #     try:
-    #         df = self.calculate_indicators(df)
-    #         last_row = df.iloc[-1]
-    #         prev_row = df.iloc[-2]
-    #         self.logger.info(f"""
-    #         Checking shakeout:
-    #         - Price: {last_row['close']}
-    #         - EMA: {last_row['center_ema']}
-    #         - MACD current: {last_row['macd']}
-    #         - MACD previous: {prev_row['macd']}
-    #         """)
-    #
-    #         if trend == 'bullish':
-    #             # Цена у средней или ниже + красная линия MACD начинает белеть
-    #             price_near_ema = last_row['close'] <= last_row['center_ema']
-    #             macd_improving = last_row['macd'] > prev_row['macd']
-    #             self.logger.info(f"""
-    #             Bullish conditions:
-    #             - Price near EMA: {price_near_ema}
-    #             - MACD improving: {macd_improving}
-    #             """)
-    #             return price_near_ema and macd_improving
-    #
-    #         elif trend == 'bearish':
-    #             # Цена у средней или выше + зеленая линия MACD начинает белеть
-    #             price_near_ema = last_row['close'] >= last_row['center_ema']
-    #             macd_declining = last_row['macd'] < prev_row['macd']
-    #             return price_near_ema and macd_declining
-    #
-    #         return False
-    #
-    #     except Exception as e:
-    #         self.logger.error(f'Ошибка при определении встряски: {str(e)}')
-    #         return False
+            return {'is_signal': False, 'type': None, 'price': 0, 'macd_value': 0, 'ema_value': 0}
 
     async def run_forever(self, alert_callback=None):
         """Основной цикл мониторинга"""
