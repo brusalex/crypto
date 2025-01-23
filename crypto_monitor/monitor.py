@@ -25,23 +25,28 @@ class CryptoShakeoutMonitor:
         }
         self.current_mode = mode
 
+        # Состояния для отслеживания движения цены
+        self.price_states = {}  # Словарь для хранения состояний цен по парам
+        
+        # Параметры для определения параболического движения
+        self.price_history_length = 10  # Сколько точек хранить для анализа движения
+        self.min_price_move = 0.005     # Минимальное движение цены (0.5%)
+
         # Настройка логирования
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('crypto_monitor.log', encoding='utf-8'),
-                logging.StreamHandler(sys.stdout)  # Use stdout for console output
+                logging.StreamHandler(sys.stdout)
             ]
         )
-        # Force console encoding to UTF-8
         if sys.platform.startswith('win'):
             import codecs
             sys.stdout.reconfigure(encoding='utf-8')
             sys.stderr.reconfigure(encoding='utf-8')
 
         self.logger = logging.getLogger(__name__)
-
         self.exchange = getattr(ccxt, exchange_id)()
         self.min_volume = min_volume
         self.check_interval = check_interval
@@ -129,81 +134,109 @@ class CryptoShakeoutMonitor:
             self.logger.exception("Полный стек ошибки:")
             return 'neutral'
 
-    def detect_shakeout(self, df: pd.DataFrame, trend: str) -> Dict:
+    def update_price_state(self, symbol: str, price_to_ema: float, is_above_ema: bool, price: float) -> None:
         """
-        Ищет точки входа в позицию на основе пробоя зоны ценности (EMA) после отката.
+        Обновляет состояние цены и отслеживает параболическое движение.
+        """
+        if symbol not in self.price_states:
+            self.price_states[symbol] = {
+                'was_above_ema': False,      # Была ли цена выше EMA
+                'highest_price_to_ema': 0.0,  # Максимальное отношение цены к EMA
+                'movement_started': False,    # Начался ли откат
+                'price_history': [],         # История движения цены
+                'ema_history': [],           # История значений EMA
+                'movement_type': None        # Тип движения (None, 'up', 'down', 'parabolic')
+            }
         
-        Args:
-            df: DataFrame со свечами (OHLCV данные)
-            trend: Текущий тренд ('bullish' - восходящий, 'bearish' - нисходящий)
+        state = self.price_states[symbol]
         
-        Returns:
-            Dict: Словарь с информацией о сигнале
+        # Обновляем историю цен и EMA
+        state['price_history'].append(price)
+        if len(state['price_history']) > self.price_history_length:
+            state['price_history'].pop(0)
+        
+        # Если цена выше EMA
+        if is_above_ema:
+            state['was_above_ema'] = True
+            if price_to_ema > state['highest_price_to_ema']:
+                state['highest_price_to_ema'] = price_to_ema
+                state['movement_started'] = False
+                state['movement_type'] = 'up'
+        
+        # Определяем тип движения на основе истории цен
+        if len(state['price_history']) >= 3:
+            prices = state['price_history']
+            
+            # Проверяем изменение направления движения
+            last_moves = [
+                (prices[-1] - prices[-2]) / prices[-2],  # Последнее движение
+                (prices[-2] - prices[-3]) / prices[-3]   # Предпоследнее движение
+            ]
+            
+            # Если было движение вверх, а теперь вниз
+            if (state['movement_type'] == 'up' and 
+                last_moves[0] < -self.min_price_move):
+                state['movement_type'] = 'down'
+                state['movement_started'] = True
+            
+            # Если движение параболическое (разворот)
+            if (state['was_above_ema'] and 
+                state['movement_type'] == 'down' and 
+                last_moves[0] > self.min_price_move and  # Цена начала расти
+                price_to_ema < 1.0):  # Но всё ещё ниже EMA
+                state['movement_type'] = 'parabolic'
+
+    def detect_shakeout(self, df: pd.DataFrame, trend: str) -> Dict:
+        """Определение сигнала встряски на основе следующих условий:
+        - На дневке бычий тренд
+        - На часовике цена была выше зоны ценности
+        - Откатилась к ней и опустилась ниже
+        - MACD находится в красной зоне
         """
         try:
-            # Рассчитываем технические индикаторы (MACD и EMA)
             df = self.calculate_indicators(df)
-            
-            # Берём последнюю завершенную свечку
-            last_candle = df.iloc[-1]
-            
-            # Создаём структуру для хранения информации о сигнале
-            signal = {
-                'is_signal': False,            # Флаг наличия сигнала
-                'type': None,                  # Тип сигнала (LONG или SHORT)
-                'price': last_candle['close'], # Текущая цена закрытия
-                'macd_value': last_candle['macd'],      # Значение MACD
-                'ema_value': last_candle['center_ema']  # Значение EMA (зона ценности)
-            }
 
-            # Считаем положение цены относительно EMA
-            price_to_ema = last_candle['close'] / last_candle['center_ema']
+            # Берем последние 24 свечи (~сутки)
+            recent_candles = df.tail(24).copy()
+            last_candle = recent_candles.iloc[-1]
+
+            signal = {
+                'is_signal': False,
+                'type': None,
+                'price': last_candle['close'],
+                'macd_value': last_candle['macd'],
+                'ema_value': last_candle['center_ema']
+            }
 
             # Логируем текущее состояние для отладки
             self.logger.info(f"""
-            Анализ в реальном времени:
-            - Текущая цена: {last_candle['close']:.2f}
-            - EMA (зона ценности): {last_candle['center_ema']:.2f}
-            - MACD: {last_candle['macd']:.6f}
-            - Тренд: {trend}
-            - Соотношение цена/EMA: {price_to_ema:.4f}
-            """)
+                Анализ часового графика:
+                - Цена: {last_candle['close']:.2f}
+                - EMA (зона ценности): {last_candle['center_ema']:.2f}
+                - MACD: {last_candle['macd']:.6f}
+                - Тренд: {trend}
+                """)
 
-            # ЛОГИКА ДЛЯ БЫЧЬЕГО ТРЕНДА (LONG)
             if trend == 'bullish':
-                # Проверяем условия для входа в LONG:
-                # 1. Цена около или ниже EMA (откат завершился)
-                # 2. MACD в красной зоне (подтверждение отката)
-                if price_to_ema <= 1.02 and last_candle['macd'] < 0:
-                    if self.is_new_signal(last_candle['close'], last_candle['center_ema'], last_candle['macd']):
-                        self.logger.info(f"""
-                        🎯 Найдена точка входа (LONG):
-                        - Цена откатилась к зоне ценности
-                        - Соотношение цена/EMA: {price_to_ema:.4f}
-                        - MACD в красной зоне: {last_candle['macd']:.6f}
-                        """)
-                        signal['is_signal'] = True
-                        signal['type'] = 'LONG'
-                        self.update_last_signal(last_candle['close'], last_candle['center_ema'], 
-                                             last_candle['macd'], 'LONG')
+                # 1. Проверяем, была ли цена выше EMA за последние 24 часа
+                was_above_ema = any(candle['close'] > candle['center_ema']
+                                    for _, candle in recent_candles.iterrows())
 
-            # ЛОГИКА ДЛЯ МЕДВЕЖЬЕГО ТРЕНДА (SHORT)
-            elif trend == 'bearish':
-                # Проверяем условия для входа в SHORT:
-                # 1. Цена около или выше EMA (откат завершился)
-                # 2. MACD в зелёной зоне (подтверждение отката)
-                if price_to_ema >= 0.98 and last_candle['macd'] > 0:
-                    if self.is_new_signal(last_candle['close'], last_candle['center_ema'], last_candle['macd']):
-                        self.logger.info(f"""
-                        🎯 Найдена точка входа (SHORT):
-                        - Цена поднялась к зоне ценности
-                        - Соотношение цена/EMA: {price_to_ema:.4f}
-                        - MACD в зелёной зоне: {last_candle['macd']:.6f}
+                # 2. Проверяем текущее положение цены относительно EMA
+                current_below_ema = last_candle['close'] < last_candle['center_ema']
+
+                # 3. Проверяем MACD в красной зоне
+                macd_below_zero = last_candle['macd'] < 0
+
+                # Все условия для сигнала
+                if was_above_ema and current_below_ema and macd_below_zero:
+                    self.logger.info(f"""
+                        🎯 Найдена точка входа (LONG):
+                        - Цена около EMA: {current_below_ema}
+                        - MACD в красной зоне: {macd_below_zero}
                         """)
-                        signal['is_signal'] = True
-                        signal['type'] = 'SHORT'
-                        self.update_last_signal(last_candle['close'], last_candle['center_ema'], 
-                                             last_candle['macd'], 'SHORT')
+                    signal['is_signal'] = True
+                    signal['type'] = 'LONG'
 
             return signal
 
@@ -232,7 +265,7 @@ class CryptoShakeoutMonitor:
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
                 # 3. Ищем встряску
-                signal = self.detect_shakeout(df, trend)
+                signal = self.detect_shakeout(df, trend, 'BTC/USDT')
 
                 if signal['is_signal']:
                     message = f"""
