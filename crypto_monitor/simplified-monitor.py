@@ -203,10 +203,15 @@ class CryptoShakeoutMonitor:
                 await asyncio.sleep(60)
 
 async def send_telegram_alert(message):
-    async with aiohttp.ClientSession() as session:
-        async with session.post("http://localhost:8000/send_message",
-                              json={"text": message}) as response:
-            await response.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("http://localhost:8000/send_message",
+                                  json={"text": message}) as response:
+                return await response.json()
+    except Exception as e:
+        print(f"Error sending telegram alert: {e}")
+        # Continue execution even if alert fails
+        return None
 
 async def main():
     monitor = CryptoShakeoutMonitor(
@@ -217,4 +222,7 @@ async def main():
     await monitor.run_forever(alert_callback=send_telegram_alert)
 
 if __name__ == "__main__":
+    if sys.platform.startswith('win'):
+        # Set up the event loop policy for Windows
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
