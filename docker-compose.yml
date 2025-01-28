@@ -1,0 +1,28 @@
+# docker-compose.yml
+services:
+  telegram-bot:
+    build:
+      context: ./telegram_service
+      dockerfile: ./Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - DEFAULT_CHAT_ID=${DEFAULT_CHAT_ID}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  elder-strategy:
+    build:
+      context: ./crypto_monitor
+      dockerfile: ./Dockerfile
+    depends_on:
+      telegram-bot:
+        condition: service_healthy
+    environment:
+      - TELEGRAM_SERVICE_URL=http://telegram-bot:8000
+    restart: unless-stopped

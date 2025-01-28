@@ -1,4 +1,6 @@
 import asyncio
+import os
+
 import aiohttp
 import ccxt
 import pandas as pd
@@ -21,15 +23,23 @@ class SignalState:
     take_profit: Optional[float]
     trailing_activated: bool = False
 
+TELEGRAM_SERVICE_URL = os.getenv('TELEGRAM_SERVICE_URL', 'http://localhost:8000')
+
+async def send_telegram_alert(message):
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{TELEGRAM_SERVICE_URL}/send_message",
+                              json={"text": message}) as response:
+            await response.json()
+
 
 class ElderTripleScreenStrategy:
     def __init__(self,
                  exchange_id: str = 'binance',
-                 check_interval: int = 3600,
+                 check_interval: int = 1200,
                  mode: str = 'INTRADAY'):
 
         self.timeframes = {
-            'SWING': {'trend': '1w', 'entry': '1d', 'intraday': '4h'},
+            'SWING': {'trend': '1w', 'entry': '1d', 'intraday': '1h'},
             'INTRADAY': {'trend': '1d', 'entry': '1h', 'intraday': '15m'}
         }
 
@@ -183,6 +193,10 @@ class ElderTripleScreenStrategy:
                 ]
                 signal_type = 'SHORT'
 
+            #     # Log the type and value of each condition
+            # for i, condition in enumerate(conditions):
+            #     self.logger.debug(f"Condition {i}: Type={type(condition)}, Value={condition}")
+
             if all(conditions):
                 stop_loss, take_profit = self.calculate_stop_levels(
                     last['close'], signal_type, df
@@ -197,24 +211,38 @@ class ElderTripleScreenStrategy:
             return None
 
         except Exception as e:
-            self.logger.error(f"Ошибка поиска входа: {str(e)}")
+            # Log the full stack trace
+            self.logger.error(f"Ошибка поиска входа: {str(e)}", exc_info=True)
             return None
 
     def calculate_stop_levels(self, price: float, signal_type: str, df: pd.DataFrame) -> Tuple[float, float]:
         """Расчет стоп-лосса и тейк-профита с использованием ATR"""
-        atr_period = 14
-        tr = df['high'].combine(df['low'].shift(),
-                                lambda x, y: max(x - y, x - df['close'].shift(), df['close'].shift() - y))
-        atr = tr.rolling(atr_period).mean().iloc[-1]
+        try:
+            atr_period = 14
 
-        if signal_type == 'LONG':
-            stop_loss = price - 2 * atr
-            take_profit = price + 3 * atr
-        else:
-            stop_loss = price + 2 * atr
-            take_profit = price - 3 * atr
+            # Рассчитываем True Range (TR) для каждой свечи
+            df['prev_close'] = df['close'].shift()  # Предыдущее закрытие
+            df['tr1'] = df['high'] - df['low']  # Разница между high и low
+            df['tr2'] = abs(df['high'] - df['prev_close'])  # Разница между high и предыдущим close
+            df['tr3'] = abs(df['low'] - df['prev_close'])  # Разница между low и предыдущим close
+            df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)  # Максимальное значение из трех
 
-        return round(stop_loss, 4), round(take_profit, 4)
+            # Рассчитываем ATR как среднее значение TR за последние 14 свечей
+            atr = df['tr'].rolling(window=atr_period).mean().iloc[-1]
+
+            # Рассчитываем стоп-лосс и тейк-профит на основе ATR
+            if signal_type == 'LONG':
+                stop_loss = price - 2 * atr
+                take_profit = price + 3 * atr
+            else:
+                stop_loss = price + 2 * atr
+                take_profit = price - 3 * atr
+
+            return round(stop_loss, 4), round(take_profit, 4)
+
+        except Exception as e:
+            self.logger.error(f"Ошибка расчета уровней стоп-лосса и тейк-профита: {str(e)}")
+            raise
 
     async def manage_risk(self, symbol: str):
         """Управление открытыми позициями"""
@@ -285,9 +313,27 @@ class ElderTripleScreenStrategy:
         """Получение текущей стоимости портфеля (заглушка)"""
         return 10000.0  # Реализовать логику получения баланса
 
-    async def run_strategy(self, symbol: str = 'BTC/USDT'):
+    #async def run_strategy(self, symbol: str = 'BTC/USDT'):
+    async def run_strategy(self, symbol: str = 'BTC/USDT', alert_callback=None):  # Добавлен параметр
         """Основной цикл торговой стратегии"""
-        self.logger.info(f"Запуск стратегии для {symbol}")
+
+        startup_message = f"""
+        🚀 Elder Triple Screen Strategy Started!
+
+        💱 Trading Pair: {symbol}
+        📊 Mode: {self.current_mode}
+
+        ⏱️ Timeframes:
+           • Trend: {self.timeframes[self.current_mode]['trend']}
+           • Entry: {self.timeframes[self.current_mode]['entry']}
+           • Intraday: {self.timeframes[self.current_mode]['intraday']}
+
+
+        🔄 Check interval: {self.check_interval} seconds
+        """
+
+        self.logger.info(startup_message)
+        await alert_callback(startup_message)
 
         while True:
             try:
@@ -297,12 +343,23 @@ class ElderTripleScreenStrategy:
                 # Поиск сигнала
                 signal = await self.check_entry_signal(symbol, trend)
 
+
+
                 if signal:
                     self.active_signals[symbol] = signal
-                    self.logger.info(f"Новый сигнал: {signal}")
+                    regular_message = f"""
+                    🚨 Cигнал на {symbol}!
+                    📈 Тип: {signal.type}
+                    💰 Цена: {signal.price:.2f}
+                    🛑 Stop Loss: {signal.stop_loss:.2f}
+                    🎯 Take Profit: {signal.take_profit:.2f}
+                    ⏰ Время: {signal.time}
+                    """
+                    self.logger.info(f"Встряска на BTC! {regular_message}")
+                    await send_telegram_alert(regular_message)
 
-                # Управление рисками
-                await self.manage_risk(symbol)
+                # # Управление рисками
+                # await self.manage_risk(symbol)
 
                 # Пауза между итерациями
                 await asyncio.sleep(self.check_interval)
@@ -314,10 +371,14 @@ class ElderTripleScreenStrategy:
                 self.logger.error(f"Ошибка биржи: {str(e)}")
                 await asyncio.sleep(300)
             except Exception as e:
-                self.logger.error(f"Критическая ошибка: {str(e)}")
+                self.logger.error(f"Критическая ошибка: {str(e)}", exc_info=True)
                 await asyncio.sleep(600)
 
 
 if __name__ == "__main__":
-    strategy = ElderTripleScreenStrategy(mode='INTRADAY')
-    asyncio.run(strategy.run_strategy())
+    async def main():
+        strategy = ElderTripleScreenStrategy(mode='SWING')
+        await strategy.run_strategy(alert_callback=send_telegram_alert)  # Передаем callback
+
+
+    asyncio.run(main())
