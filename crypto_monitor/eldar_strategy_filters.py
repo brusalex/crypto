@@ -1,4 +1,6 @@
 import asyncio
+import os
+
 import aiohttp
 import ccxt
 import pandas as pd
@@ -21,11 +23,12 @@ class SignalState:
     take_profit: Optional[float]
     trailing_activated: bool = False
 
+TELEGRAM_SERVICE_URL = os.getenv('TELEGRAM_SERVICE_URL', 'http://localhost:8000')
 
 async def send_telegram_alert(message):
     async with aiohttp.ClientSession() as session:
-        async with session.post("http://localhost:8000/send_message",
-                                json={"text": message}) as response:
+        async with session.post(f"{TELEGRAM_SERVICE_URL}/send_message",
+                              json={"text": message}) as response:
             await response.json()
 
 
@@ -140,26 +143,31 @@ class ElderTripleScreenStrategy:
             raise
 
     async def analyze_trend(self, symbol: str) -> dict:
-        """Анализ тренда с обработкой ошибок"""
         try:
             timeframe = self.timeframes[self.current_mode]['trend']
             df = await self.safe_fetch_ohlcv(symbol, timeframe, self.min_candles['trend'])
 
             if not self.validate_data(df, self.min_candles['trend'], timeframe):
-                return {'trend': 'neutral', 'strength': 'none'}
+                return {'trend': 'neutral'}
 
             df = self.calculate_indicators(df)
             last_hist = df['macd_hist'].iloc[-1]
+            prev_hist = df['macd_hist'].iloc[-2]
 
-            trend = 'bullish' if last_hist > 0 else 'bearish'
-            return {'trend': trend, 'hist_value': last_hist}
+            if last_hist > prev_hist:
+                trend = 'bullish'
+            elif last_hist < prev_hist:
+                trend = 'bearish'
+            else:
+                trend = 'neutral'
+
+            return {'trend': trend}
 
         except Exception as e:
             self.logger.error(f"Ошибка анализа тренда: {str(e)}")
-            return {'trend': 'neutral', 'strength': 'none'}
+            return {'trend': 'neutral'}
 
     async def check_entry_signal(self, symbol: str, trend: dict) -> Optional[SignalState]:
-        """Поиск точек входа с улучшенными условиями"""
         try:
             timeframe = self.timeframes[self.current_mode]['entry']
             df = await self.safe_fetch_ohlcv(symbol, timeframe, self.min_candles['entry'])
@@ -173,44 +181,59 @@ class ElderTripleScreenStrategy:
 
             if trend['trend'] == 'bullish':
                 conditions = [
-                    last['%K'] < 30,
-                    last['%K'] > prev['%K'],
-                    last['bear_power'] > prev['bear_power'],
-                    last['force_index_ema2'] > prev['force_index_ema2'],
-                    last['macd_hist'] > prev['macd_hist']
+                    last['%K'] < 30 and last['%K'] > prev['%K'],
+                    last['force_index_ema2'] < 0 and last['force_index_ema2'] > prev['force_index_ema2']
                 ]
                 signal_type = 'LONG'
-            else:
+            elif trend['trend'] == 'bearish':
                 conditions = [
-                    last['%K'] > 70,
-                    last['%K'] < prev['%K'],
-                    last['bull_power'] < prev['bull_power'],
-                    last['force_index_ema2'] < prev['force_index_ema2'],
-                    last['macd_hist'] < prev['macd_hist']
+                    last['%K'] > 70 and last['%K'] < prev['%K'],
+                    last['force_index_ema2'] > 0 and last['force_index_ema2'] < prev['force_index_ema2']
                 ]
                 signal_type = 'SHORT'
-
-            #     # Log the type and value of each condition
-            # for i, condition in enumerate(conditions):
-            #     self.logger.debug(f"Condition {i}: Type={type(condition)}, Value={condition}")
+            else:
+                return None
 
             if all(conditions):
-                stop_loss, take_profit = self.calculate_stop_levels(
-                    last['close'], signal_type, df
-                )
-                return SignalState(
-                    time=datetime.now(),
-                    price=last['close'],
-                    type=signal_type,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit
-                )
+                # Проверяем третий фильтр на внутридневном таймфрейме
+                if await self.confirm_entry(symbol, signal_type):
+                    stop_loss, take_profit = self.calculate_stop_levels(last['close'], signal_type, df)
+                    return SignalState(
+                        time=datetime.now(),
+                        price=last['close'],
+                        type=signal_type,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit
+                    )
             return None
 
         except Exception as e:
-            # Log the full stack trace
-            self.logger.error(f"Ошибка поиска входа: {str(e)}", exc_info=True)
+            self.logger.error(f"Ошибка поиска входа: {str(e)}")
             return None
+
+    async def confirm_entry(self, symbol: str, signal_type: str) -> bool:
+        try:
+            timeframe = self.timeframes[self.current_mode]['intraday']
+            df = await self.safe_fetch_ohlcv(symbol, timeframe, self.min_candles['intraday'])
+
+            if not self.validate_data(df, self.min_candles['intraday'], timeframe):
+                return False
+
+            df['ema_short'] = df['close'].ewm(span=5, adjust=False).mean()  # 5-периодная EMA
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            if signal_type == 'LONG':
+                # Цена пересекает EMA вверх
+                return prev['close'] < prev['ema_short'] and last['close'] > last['ema_short']
+            elif signal_type == 'SHORT':
+                # Цена пересекает EMA вниз
+                return prev['close'] > prev['ema_short'] and last['close'] < last['ema_short']
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Ошибка подтверждения входа: {str(e)}")
+            return False
 
     def calculate_stop_levels(self, price: float, signal_type: str, df: pd.DataFrame) -> Tuple[float, float]:
         """Расчет стоп-лосса и тейк-профита с использованием ATR"""
@@ -313,8 +336,24 @@ class ElderTripleScreenStrategy:
     #async def run_strategy(self, symbol: str = 'BTC/USDT'):
     async def run_strategy(self, symbol: str = 'BTC/USDT', alert_callback=None):  # Добавлен параметр
         """Основной цикл торговой стратегии"""
-        self.logger.info(f"Запуск стратегии для {symbol}")
-        await send_telegram_alert(f"Запуск стратегии для {symbol}")
+
+        startup_message = f"""
+        🚀 Elder Triple Screen Strategy Started!
+
+        💱 Trading Pair: {symbol}
+        📊 Mode: {self.current_mode}
+
+        ⏱️ Timeframes:
+           • Trend: {self.timeframes[self.current_mode]['trend']}
+           • Entry: {self.timeframes[self.current_mode]['entry']}
+           • Intraday: {self.timeframes[self.current_mode]['intraday']}
+
+
+        🔄 Check interval: {self.check_interval} seconds
+        """
+
+        self.logger.info(startup_message)
+        await alert_callback(startup_message)
 
         while True:
             try:
@@ -356,13 +395,9 @@ class ElderTripleScreenStrategy:
                 await asyncio.sleep(600)
 
 
-# if __name__ == "__main__":
-#     strategy = ElderTripleScreenStrategy(mode='SWING')
-#     asyncio.run(strategy.run_strategy())
-
 if __name__ == "__main__":
     async def main():
-        strategy = ElderTripleScreenStrategy(mode='INTRADAY')
+        strategy = ElderTripleScreenStrategy(mode='SWING')
         await strategy.run_strategy(alert_callback=send_telegram_alert)  # Передаем callback
 
 
