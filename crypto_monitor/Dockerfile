@@ -8,7 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy strategy code
-COPY eldar_strategy.py .
+COPY eldar_strategy_filters.py .
 
 # Run the strategy
-CMD ["python", "eldar_strategy.py"]
+CMD ["python", "eldar_strategy_filters.py"]
